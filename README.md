@@ -24,11 +24,14 @@ flowchart LR
     FE["ndp-frontend\n(one Keycloak client per CNDP deployment)"]
     WA["ndp-workspaces-api"]
     JH["ndp-jupyterhub"]
+    EP["ndp-ep (ep-api)"]
     Other["Other NDP services\n(each its own Keycloak client)"]
 
     FE -->|OIDC login, token refresh| KC
     WA -->|verifies bearer tokens| KC
     JH -->|OIDC login, token refresh| KC
+    EP -->|"optional OIDC login, /user/login proxy"| KC
+    EP -.->|"bearer token → /information"| API
     Other -->|OIDC / bearer tokens| KC
     FE -.->|group/user admin calls| API
     WA -.->|group/user admin calls| API
@@ -46,7 +49,7 @@ flowchart LR
 
 ### 1.2 How individual services use it
 
-Two service teams documented their own integration in detail; a third (`ndp-jupyterhub`) is summarized here directly from its deployment repo. All three are condensed as illustrative examples of the same underlying pattern.
+Two service teams documented their own integration in detail; `ndp-jupyterhub` and `ndp-ep` are summarized here directly from their repos. All four are condensed as illustrative examples of the same underlying pattern.
 
 #### ndp-frontend
 
@@ -71,9 +74,17 @@ Two service teams documented their own integration in detail; a third (`ndp-jupy
 - **Admin operations:** none — ndp-jupyterhub never calls the AAI API or Keycloak's Admin REST API. It only performs the end-user OIDC login/refresh directly against Keycloak (refreshing the access token itself via the token endpoint, roughly daily or before each spawn), then reuses the user's own access token to call `ndp-workspaces-api` on their behalf (listing their workspaces/entities, provisioning and updating their PVCs).
 - **Sensitive info exposed to this service:** username and login-group membership, plus — via the access/refresh token pair copied into every notebook pod's environment — whatever those tokens are valid for, for as long as they remain valid, directly exposed to user-run code inside the notebook.
 
+#### ndp-ep (ep-api + ndp-ep-py)
+
+- **How it authenticates:** ep-api never decodes or verifies a JWT itself — every request's bearer token is POSTed as-is to the AAI API's `/information` endpoint (`AUTH_API_URL`), and whatever `{sub, username, roles, groups}` comes back is trusted directly; there's no local signature check. A caller can arrive at that token three ways: pasting one obtained elsewhere; calling ep-api's own `POST /user/login`, which proxies a username/password straight to the AAI's `/user/login` (Keycloak Resource Owner Password Credentials) and hands back the raw access token; or, if the deployment opts in (`OIDC_ENABLED`, off by default), a standard OIDC Authorization Code + PKCE flow against a dedicated **public** Keycloak client, added specifically for users who authenticate through a federated identity provider (CILogon, EarthScope, ORCID) and so have no realm password to type into the second option. A companion Python SDK, `ndp-ep-py`, does no authentication of its own — it just carries a caller-supplied token as a Bearer header into every ep-api call. A dev-only `TEST_TOKEN` bypass also exists that skips the AAI call entirely; it's documented as required to be left blank in production.
+- **What it retrieves from Keycloak (via the AAI, not directly):** the same unfiltered `sub`, `username`, `roles` (every realm role) and `groups` (every group) that ndp-frontend/ndp-workspaces-api read directly out of the token — ep-api just gets them relayed through the AAI's live lookup instead. It layers its own three-tier permission model (`viewer`/`writer`/`admin`) on top by pattern-matching six specific role names — `ndp_{tier}` (platform-wide) or `group:{endpoint-uuid}:{tier}` (per-endpoint) — out of that same full, unfiltered `roles` list; every other role the user holds rides along unused.
+- **Where that data lives:** ep-api doesn't persist tokens or claims — the AAI lookup happens fresh on every request. It does derive and store one thing from the user's `sub`: a truncated SHA-256 hash (`ndp_creator_md5` / `ndp_user_id`) stamped onto every catalog resource the user creates, used as a pseudonymous "creator" identifier so downstream consumers (e.g. Search) can filter by creator without the raw `sub`, name, or email ever being exposed on the resource itself.
+- **Admin operations:** a thin wrapper (`aai_client.py`) calls the same AAI endpoints documented in §1.1 (`/group/add-user`, `/role/assign`, `/group/members`) to back its access-request approval workflow — always using the requesting admin's own bearer token, never a standing service-account credential.
+- **Sensitive info exposed to this service:** the same platform-wide, unfiltered roles and groups every other client receives; plus, whenever the username/password login path is used, ep-api's own `/user/login` endpoint sees the user's raw Keycloak password in transit (proxied straight through to the AAI, not stored) before it ever reaches Keycloak.
+
 ### 1.3 The pattern
 
-`ndp-workspace-api` and `ndp-frontend` (and, by construction of the current token mappers, every other NDP client):
+`ndp-frontend`, `ndp-workspaces-api`, and `ndp-ep` (and, by construction of the current token mappers, every other NDP client that reads roles/groups the same way):
 
 - Every client gets the user's **entire** group membership and **entire** realm role list, not just what pertains to it.
 - Clients trust that content directly, with no per-client filtering happening at the Keycloak layer.
