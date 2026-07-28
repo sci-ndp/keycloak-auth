@@ -23,13 +23,16 @@ flowchart LR
     end
     FE["ndp-frontend\n(one Keycloak client per CNDP deployment)"]
     WA["ndp-workspaces-api"]
+    JH["ndp-jupyterhub"]
     Other["Other NDP services\n(each its own Keycloak client)"]
 
     FE -->|OIDC login, token refresh| KC
     WA -->|verifies bearer tokens| KC
+    JH -->|OIDC login, token refresh| KC
     Other -->|OIDC / bearer tokens| KC
     FE -.->|group/user admin calls| API
     WA -.->|group/user admin calls| API
+    JH -.->|forwards user's token| WA
 ```
 
 - **Keycloak 26** is the identity provider (IdP) for the single `NDP` realm — every NDP-affiliated service authenticates users against it.
@@ -43,7 +46,7 @@ flowchart LR
 
 ### 1.2 How individual services use it
 
-Two service teams documented their own integration in detail; both are condensed here as illustrative examples of the same underlying pattern.
+Two service teams documented their own integration in detail; a third (`ndp-jupyterhub`) is summarized here directly from its deployment repo. All three are condensed as illustrative examples of the same underlying pattern.
 
 #### ndp-frontend
 
@@ -60,9 +63,17 @@ Two service teams documented their own integration in detail; both are condensed
 - **Admin operations:** has its own wrapper around the Keycloak Admin REST API for group/user lookups and membership management (service-to-service, not end-user tokens).
 - **Sensitive info exposed to this service:** the same platform-wide roles/groups as above, trusted directly from the token with no independent check of whether they're relevant to this service — plus a persisted copy of the user's name and email that outlives the login session entirely.
 
+#### ndp-jupyterhub
+
+- **How it authenticates:** standard OIDC Authorization Code flow via JupyterHub's `GenericOAuthenticator` (subclassed as `MyAuthenticator`), talking directly to Keycloak's `/realms/NDP/protocol/openid-connect/*` endpoints, requesting only the `openid` and `profile` scopes (not `email`). One dedicated Keycloak client per deployment, with `client_id`/`client_secret` delivered by NDP admins and stored as a Kubernetes secret.
+- **What it retrieves from Keycloak:** after login, it calls Keycloak's `/userinfo` endpoint (passing the access token as Bearer auth) rather than decoding any claim out of the token itself. From that response it reads `preferred_username` (used directly as the JupyterHub username) and a `groups` field, which it checks against a single allow-listed login group (e.g. `jhub_user`) — anyone not in that group is denied login outright; a separate static list of admin emails grants JupyterHub-admin privileges, independent of any Keycloak role. It does not consume `realm_access.roles` or the full `groups` claim the way ndp-frontend/ndp-workspaces-api do. Note that the access token it presents to `/userinfo` doesn't itself need to carry a `groups` claim — Keycloak only requires the token to have been granted the `openid` scope, and builds the `/userinfo` response (including `groups`) fresh from the realm's configured mappers, independent of what claims happen to be embedded in the token.
+- **Where that data lives:** the OAuth `access_token` and `refresh_token` are persisted as JupyterHub "auth state" in the Hub's own database, and are also injected as **plaintext environment variables (`ACCESS_TOKEN`, `REFRESH_TOKEN`) inside every spawned single-user notebook pod** — so the user's live token pair is directly readable by any code the user runs in their own notebook.
+- **Admin operations:** none — ndp-jupyterhub never calls the AAI API or Keycloak's Admin REST API. It only performs the end-user OIDC login/refresh directly against Keycloak (refreshing the access token itself via the token endpoint, roughly daily or before each spawn), then reuses the user's own access token to call `ndp-workspaces-api` on their behalf (listing their workspaces/entities, provisioning and updating their PVCs).
+- **Sensitive info exposed to this service:** username and login-group membership, plus — via the access/refresh token pair copied into every notebook pod's environment — whatever those tokens are valid for, for as long as they remain valid, directly exposed to user-run code inside the notebook.
+
 ### 1.3 The pattern
 
-Across both services (and, by construction of the current token mappers, every other NDP client):
+`ndp-workspace-api` and `ndp-frontend` (and, by construction of the current token mappers, every other NDP client):
 
 - Every client gets the user's **entire** group membership and **entire** realm role list, not just what pertains to it.
 - Clients trust that content directly, with no per-client filtering happening at the Keycloak layer.
@@ -94,7 +105,7 @@ Together, these mean a client's tokens shrink to contain only what that client n
 
 ### 2.3 How this would affect NDP services
 
-Using the two services profiled in Part 1 as concrete examples of what changes:
+Using the services profiled in Part 1 as concrete examples of what changes:
 
 - **ndp-frontend** currently reads `realm_access.roles` and the full `groups` array straight off the token for its permission checks, including a CMS-driven pattern where arbitrary additional groups can be referenced per page. Under the new model, ndp-frontend's Keycloak client would need its own Group policy that explicitly covers every group/role it currently depends on (`professor`, `catalog_admin`, `ckan_admin`, `jhub_user`, the per-deployment admin group, the `ndp_ep/*` composite groups, and any CMS-supplied ones) — anything not enumerated there would no longer show up implicitly just because it happened to be in the token.
 - **ndp-workspaces-api** currently trusts whatever roles/groups arrive in the bearer token for nearly every route via `Depends(get_user_info)`. It would move to the same audience-restricted validation, and — by design — would stop seeing groups/roles that belong to other clients, even for the same user. Any workflow that currently relies on that (e.g., cross-service checks) would need to go through the AAI API's service-account path instead, which isn't affected by this change since it's a trusted backend call, not an end-user token.
