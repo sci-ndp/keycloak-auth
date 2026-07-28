@@ -40,8 +40,8 @@ flowchart LR
 
 - **Keycloak 26** is the identity provider (IdP) for the single `NDP` realm — every NDP-affiliated service authenticates users against it.
 - **PostgreSQL** is Keycloak's backing store (users, groups, roles, sessions).
-- **AAI API** is a custom Flask service that sits in front of Keycloak's Admin REST API. Instead of handing product teams direct Keycloak admin credentials, they call this API, which enforces a group-based permission model on their behalf (see below) and is the only thing with standing admin access to Keycloak.
-- **Admin Console UI** is a custom front-end for the AAI API, used to manage groups, roles, members, and attributes without touching Keycloak's own admin console.
+- **AAI API** is a custom FastAPI service that sits in front of Keycloak's Admin REST API. Instead of handing product teams direct Keycloak admin credentials, they call this API, which enforces a group-based permission model on their behalf (see below) and is the only thing with standing admin access to Keycloak.
+- **Admin Console UI** is a custom front-end for the AAI API, used to manage fast user lookups, group lookups, whitelist management, without touching Keycloak's own admin console.
 
 **How permissions are modeled today:** access is organized around Keycloak **groups** (e.g. `ndp_ep/ep-123`, each group automatically gets three realm roles named `group:<path>:admin`, `group:<path>:editor`, `group:<path>:viewer`; `jhub_user`). The AAI API checks these role names to decide whether a caller can manage a given group. This is the mechanism that lets teams self-serve group/role management without a central admin doing it by hand.
 
