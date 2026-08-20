@@ -4,6 +4,7 @@
 |---|---|---|
 | [problem.md](problem.md) | How NDP services use Keycloak today, what each one exposes, and the client-scoped model that fixes it | want the background, or want to know why adopt this new approach |
 | [ndp-new-auth.md](ndp-new-auth.md) | Walkthrough of the new model: create a client, put people in groups, ask Keycloak for a decision | are integrating a service and want the calls to make |
+| [governance-coverage.md](governance-coverage.md) | How this model maps onto the proposed governance framework — what it covers, what it can't express, and what to watch for | want to know how this lines up with the governance framework |
 
 ## The idea in three lines
 
