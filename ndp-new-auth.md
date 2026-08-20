@@ -1,7 +1,8 @@
 # NDP New Auth Walkthrough
 
-Your service asks Keycloak "may this user do X?" and gets back yes or no. No role
-parsing in your code, and the rule changes without a redeploy.
+Your app makes the authorization decision. It asks Keycloak to evaluate the access rules
+for a user — "would these rules allow X?" — and enforces the answer itself. No role parsing
+in your code, and the rules change without a redeploy.
 
 ## 0. Who does what
 
@@ -19,8 +20,8 @@ Read this table before anything else — most confusion comes from mixing them u
 that groups exist. A user is *placed* into a group by someone who already administers
 it. If you are writing a UI for end users, there is no "create group" button in it.
 
-Sections 1 and 3 below are admin work. Section 4 is the only part your service code does
-at runtime.
+Sections 1 and 3 below are admin work. Section 4 is the only part your app does at
+runtime.
 
 ## 1. Onboard: configure a client for your app
 
@@ -103,8 +104,9 @@ Users are identified by **email** in the NDP realm.
 
 ## 4. Ask for a decision
 
-This is the call your service makes per request, with the **user's** token. No
-client secret involved.
+This is the call your app makes, with the **user's** token. No client secret
+involved. Keycloak evaluates the access rules you configured in step 1 and returns the
+result; **your app is what allows or blocks the request.**
 
 ```bash
 curl --location 'https://dev-idp.nationaldataplatform.org/realms/NDP/protocol/openid-connect/token' \
@@ -122,7 +124,7 @@ curl --location 'https://dev-idp.nationaldataplatform.org/realms/NDP/protocol/op
 | status | body | meaning |
 |---|---|---|
 | `200` | `{"result": true}` | allow |
-| `403` | `{"error":"access_denied"}` | a rule said no |
+| `403` | `{"error":"access_denied"}` | the rules evaluate to no |
 | `401` | — | the token is invalid or expired |
 
 >**Caveat — the token must come from the public Keycloak URL.** A token minted through the
@@ -133,114 +135,10 @@ just belongs to a different issuer. Get the token straight from
 `https://dev-idp.nationaldataplatform.org/realms/NDP/protocol/openid-connect/token` and the
 same call succeeds.
 
-## A real use case: provisioning an NDP Endpoint
-
-When someone registers an endpoint with `POST /ep/simple`, the
-[NDP Federation API](https://github.com/sci-ndp/ndp-federation) does the Keycloak setup on
-their behalf. The requester never creates a group — they asked to *register an endpoint*.
-
-### Today: two calls
-
-[pop.py:461-489](https://github.com/sci-ndp/ndp-federation/blob/fe4ca0d68faf9a4fd461bf739ac8d3dcef08a9ec/app/services/pop.py#L461-L489),
-as the platform admin using a factory client:
-
-1. `/client/create` with `{"clientName": "ep-{id}"}` — nothing else.
-2. `/group/create` with `{"groupName": "ndp_ep/ep-{id}", "adminUsers": [userid]}`.
-
-The group is fine. The problem is the client is created **with no group**, so it has no
-resources and no policies — nothing to answer a `permission=` question. The two are
-linked only by matching names in the federation's code, not in Keycloak.
-
-### With the new `/client/create`: one call
-
-```bash
-curl --location 'https://dev-idp.nationaldataplatform.org/api/client/create' \
---header 'Content-Type: application/json' \
---header 'Authorization: Bearer {{FACTORY-TOKEN}}' \
---data '{
-  "clientName": "ep-{id}",
-  "groupName": "ndp_ep/ep-{id}",
-  "adminUsers": ["{userid}"]
-}'
-```
-
-Same client, same group, same seeded admin — plus the access rules that make section 4
-work. In `keycloak.py`, fold `create_group` into the `create_client` payload and delete it.
-
-### The roles are different, and this is the real difference
-
-| | old `/group/create` | new `/client/create` |
-|---|---|---|
-| creates | **realm roles** | realm roles **+ client roles** |
-| named | `group:ndp_ep/ep-{id}:admin` | `admin` on client `ep-{id}` |
-| lives in | the realm, shared by everything | that one client |
-| in the token | `realm_access.roles`, everywhere | `resource_access.ep-{id}.roles`, only here |
-
-The old call gives you realm roles only — one realm-wide role per group per level, piling
-up in a namespace everything shares. The new call also mints a **client role** per
-permission level and maps it to that level's subgroup, so the client's own gates are
-backed by roles scoped to it. Two payoffs: your service can read
-`resource_access.ep-{id}.roles` straight from the token instead of asking, and the
-client's token scope is confined to those roles, so its tokens stop carrying whatever else
-the user happens to hold elsewhere in the realm.
-
-**Hand-off.** The platform admin is now out of the loop. The endpoint's admin adds
-colleagues with `/group/add-user` against `ndp_ep/ep-{id}`, as in section 3. An admin of
-the parent `ndp_ep` still covers every endpoint under it.
-
-### Guarding the EP's API with the policies
-
-The EP service never reads a role from token. One dependency asks section 4 and honors the answer:
-
-```python
-DECISION_URL = f"{IDP}/realms/NDP/protocol/openid-connect/token"
-
-def requires(permission: str):
-    async def guard(request: Request):
-        async with httpx.AsyncClient(timeout=5) as c:
-            r = await c.post(DECISION_URL,
-                headers={"Authorization": request.headers.get("authorization", "")},
-                data={"grant_type": "urn:ietf:params:oauth:grant-type:uma-ticket",
-                      "audience": CLIENT_ID,          # ep-{id}
-                      "permission": permission,       # viewer-area / editor-area / admin-area
-                      "response_mode": "decision"})
-        if r.status_code != 200:
-            raise HTTPException(status_code=403, detail="Not allowed")
-    return Depends(guard)
-```
-
-Then each route names the level it needs:
-
-```python
-@router.get("/datasets",         dependencies=[requires("viewer-area")])
-@router.post("/datasets",        dependencies=[requires("editor-area")])
-@router.delete("/datasets/{id}", dependencies=[requires("admin-area")])
-```
-
-That is the whole guard. No role names, no group names, no `ENABLE_GROUP_BASED_ACCESS`
-flag — it replaces the hand-parsing in ep-api's `authorization_service.py`
-(`check_group_membership`, `group:{ep_uuid}:writer`, and the rest). Access changes when
-someone is moved between levels, not when this code changes.
-
-**Offline variant.** Because the new `/client/create` also mints client roles, a token
-issued for this client already carries `resource_access["ep-{id}"]["roles"]`. Reading that
-from the verified token gives the same answer with no network call — faster, but it goes
-stale until the token is refreshed, while the decision call is always current. Use the
-decision call for anything destructive.
-
-So the three layers stay clean:
-
-```
-platform admin  →  provisions client + group        (once, one call)
-EP admin        →  adds/moves members               (ongoing, self-service)
-EP service      →  asks Keycloak per request        (runtime, no roles in code)
-end user        →  logs in                          (that's all)
-```
-
 ## Changing who has access
 
-Move someone between permission levels, the **next** decision reflects it. Nothing to redeploy,
-no need to refresh the token.
+Move someone between permission levels, and the **next** evaluation reflects it — so does the
+next decision your app makes. Nothing to redeploy, no need to refresh the token.
 
 Every access change is a **membership** change made by a group admin. Nobody creates a
 group to grant access, nobody edits code, and nobody touches the client. If the answer to
