@@ -125,6 +125,14 @@ curl --location 'https://dev-idp.nationaldataplatform.org/realms/NDP/protocol/op
 | `403` | `{"error":"access_denied"}` | a rule said no |
 | `401` | — | the token is invalid or expired |
 
+>**Caveat — the token must come from the public Keycloak URL.** A token minted through the
+AAI's `/api/client/login` carries `iss=http://keycloak:8080/realms/NDP`, the container's
+internal address. The decision call above goes to `dev-idp.nationaldataplatform.org`, whose
+issuer is the public URL, so it rejects that token with a `401` — the token is valid, it
+just belongs to a different issuer. Get the token straight from
+`https://dev-idp.nationaldataplatform.org/realms/NDP/protocol/openid-connect/token` and the
+same call succeeds.
+
 ## A real use case: provisioning an NDP Endpoint
 
 When someone registers an endpoint with `POST /ep/simple`, the
